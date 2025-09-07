@@ -5,9 +5,9 @@ This module provides a more in-depth investigation of Wordpress detection.
 ## Set up
 
 ```
-$ tinygo build -o wordpress.wasm -scheduler=none -target=wasi --no-debug wordpress.go 
-$ mkdir -p ~/.trivy/modules
-$ cp wordpress.wasm ~/.trivy/modules
+GOOS=wasip1 GOARCH=wasm go build -o wordpress.wasm -buildmode=c-shared wordpress.go 
+mkdir -p ~/.trivy/modules
+mv wordpress.wasm ~/.trivy/modules
 ```
 
 It is also available in [GHCR][trivy-module-wordpress].
@@ -29,3 +29,12 @@ $ trivy image wordpress:5.7.1
 In the above example, CVE-2020-36326 and CVE-2018-19296 will be detected if the WordPress version is vulnerable.
 
 [trivy-module-wordpress]: https://github.com/orgs/aquasecurity/packages/container/package/trivy-module-wordpress
+
+
+
+
+go get -u
+GOPROXY=https://proxy.golang.org go mod tidy
+
+
+

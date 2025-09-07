@@ -1,5 +1,3 @@
-//go:build tinygo.wasm
-
 package main
 
 import (
@@ -11,20 +9,36 @@ import (
 	"github.com/hashicorp/go-version"
 
 	dbTypes "github.com/aquasecurity/trivy-db/pkg/types"
+	ftypes "github.com/aquasecurity/trivy/pkg/fanal/types"
 	"github.com/aquasecurity/trivy/pkg/module/api"
 	"github.com/aquasecurity/trivy/pkg/module/serialize"
 	"github.com/aquasecurity/trivy/pkg/module/wasm"
 	"github.com/aquasecurity/trivy/pkg/types"
 )
 
+type Module interface {
+	Version() int
+	Name() string
+}
+
+type Analyzer interface {
+	RequiredFiles() []string
+	Analyze(filePath string) (*serialize.AnalysisResult, error)
+}
+
+type PostScanner interface {
+	PostScanSpec() serialize.PostScanSpec
+	PostScan(types.Results) (types.Results, error)
+}
+
 const (
 	moduleVersion = 1
-	moduleName    = "wordpress"
-	typeWPVersion = "wordpress-version"
+	name          = "wordpress-module"
 )
 
-// main is required for TinyGo to compile to Wasm.
-func main() {
+func main() {}
+
+func init() {
 	wasm.RegisterModule(WordpressModule{})
 }
 
@@ -37,8 +51,10 @@ func (WordpressModule) Version() int {
 }
 
 func (WordpressModule) Name() string {
-	return moduleName
+	return name
 }
+
+const typeWPVersion = "wordpress-version"
 
 func (WordpressModule) RequiredFiles() []string {
 	return []string{
@@ -46,7 +62,7 @@ func (WordpressModule) RequiredFiles() []string {
 	}
 }
 
-func (s WordpressModule) Analyze(filePath string) (*serialize.AnalysisResult, error) {
+func (WordpressModule) Analyze(filePath string) (*serialize.AnalysisResult, error) {
 	f, err := os.Open(filePath) // e.g. filePath: /usr/src/wordpress/wp-includes/version.php
 	if err != nil {
 		return nil, err
@@ -61,6 +77,7 @@ func (s WordpressModule) Analyze(filePath string) (*serialize.AnalysisResult, er
 			continue
 		}
 
+		wasm.Info(fmt.Sprintf("line : %s", line))
 		ss := strings.Split(line, "=")
 		if len(ss) != 2 {
 			return nil, fmt.Errorf("invalid wordpress version: %s", line)
@@ -68,16 +85,21 @@ func (s WordpressModule) Analyze(filePath string) (*serialize.AnalysisResult, er
 
 		// NOTE: it is an example; you actually need to handle comments, etc
 		ss[1] = strings.TrimSpace(ss[1])
-		wpVersion = strings.Trim(ss[1], `''";`)
+		ss[1] = strings.Trim(ss[1], `"`)
+		ss[1] = strings.Trim(ss[1], `'`)
+		ss[1] = strings.Trim(ss[1], `";`)
+		ss[1] = strings.Trim(ss[1], `';`)
+		wpVersion = strings.Trim(ss[1], `;`)
 		wasm.Info(fmt.Sprintf("WordPress Version: %s", wpVersion))
 	}
+
 
 	if err = scanner.Err(); err != nil {
 		return nil, err
 	}
 
 	return &serialize.AnalysisResult{
-		CustomResources: []serialize.CustomResource{
+		CustomResources: []ftypes.CustomResource{
 			{
 				Type:     typeWPVersion,
 				FilePath: filePath,
@@ -93,18 +115,28 @@ func (WordpressModule) PostScanSpec() serialize.PostScanSpec {
 	}
 }
 
-func (WordpressModule) PostScan(results serialize.Results) (serialize.Results, error) {
-	wasm.Info("post scan")
-
-	// https://wpscan.com/vulnerability/4cd46653-4470-40ff-8aac-318bee2f998d
-	affectedVersion, err := version.NewConstraint(">=5.7, <5.7.2")
-	if err != nil {
-		return nil, err
-	}
-
+func (WordpressModule) PostScan(results types.Results) (types.Results, error) {
+	// e.g. results
+	// [
+	//   {
+	//     "Target": "",
+	//     "Class": "custom",
+	//     "CustomResources": [
+	//       {
+	//         "Type": "wordpress-version",
+	//         "FilePath": "/usr/src/wordpress/wp-includes/version.php",
+	//         "Layer": {
+	//           "DiffID": "sha256:057649e61046e02c975b84557c03c6cca095b8c9accd3bd20eb4e432f7aec887"
+	//         },
+	//         "Data": "5.7.1"
+	//       }
+	//     ]
+	//   }
+	// ]
+	affectedVersion, _ := version.NewConstraint(">=5.7, <7.7.2")
 	var (
-		vulnerable        bool
-		wpPath, wpVersion string
+		vulnerable                           bool
+		wpPath, wpVersionAffected string
 	)
 	for _, result := range results {
 		if result.Class != types.ClassCustom {
@@ -112,17 +144,21 @@ func (WordpressModule) PostScan(results serialize.Results) (serialize.Results, e
 		}
 
 		for _, c := range result.CustomResources {
+			wpPath = c.FilePath
 			if c.Type != typeWPVersion {
 				continue
 			}
-			wpPath = c.FilePath
-			wpVersion = c.Data.(string)
-			wasm.Info(fmt.Sprintf("WordPress Version: %s", wpVersion))
+
+			wpVersion := c.Data.(string)
+			if wpVersion != "" {
+				wpVersionAffected = wpVersion
+			}
 
 			ver, err := version.NewVersion(wpVersion)
 			if err != nil {
 				return nil, err
 			}
+
 			if affectedVersion.Check(ver) {
 				vulnerable = true
 			}
@@ -131,8 +167,8 @@ func (WordpressModule) PostScan(results serialize.Results) (serialize.Results, e
 	}
 
 	if vulnerable {
-		// Add CVE-2020-36326 and CVE-2018-19296
-		results = append(results, serialize.Result{
+		// Add CVE-2020-36326
+		results = append(results, types.Result{
 			Target: wpPath,
 			Class:  types.ClassLangPkg,
 			Type:   "wordpress",
@@ -140,7 +176,7 @@ func (WordpressModule) PostScan(results serialize.Results) (serialize.Results, e
 				{
 					VulnerabilityID:  "CVE-2020-36326",
 					PkgName:          "wordpress",
-					InstalledVersion: wpVersion,
+					InstalledVersion: wpVersionAffected,
 					FixedVersion:     "5.7.2",
 					Vulnerability: dbTypes.Vulnerability{
 						Title:    "PHPMailer 6.1.8 through 6.4.0 allows object injection through Phar Deserialization via addAttachment with a UNC pathname.",
@@ -150,16 +186,25 @@ func (WordpressModule) PostScan(results serialize.Results) (serialize.Results, e
 				{
 					VulnerabilityID:  "CVE-2018-19296",
 					PkgName:          "wordpress",
-					InstalledVersion: wpVersion,
+					InstalledVersion: wpVersionAffected,
 					FixedVersion:     "5.7.2",
 					Vulnerability: dbTypes.Vulnerability{
 						Title:    "PHPMailer before 5.2.27 and 6.x before 6.0.6 is vulnerable to an object injection attack.",
 						Severity: "HIGH",
 					},
 				},
+				{
+					VulnerabilityID:  "CVE-2018-19216",
+					PkgName:          "wordpress",
+					InstalledVersion: wpVersionAffected,
+					FixedVersion:     "6.7.2",
+					Vulnerability: dbTypes.Vulnerability{
+						Title:    "PHPMailer before 5.2.27 and 6.x before 6.0.6 is vulnerable to an object injection attack.",
+						Severity: "CRITICAL",
+					},
+				},
 			},
 		})
 	}
-
 	return results, nil
 }
